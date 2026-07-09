@@ -9,3 +9,5 @@ config.json
 kaggle_output/*
 kaggle_output-v1-overfitted.zip
 Modelfile
+KAGGLE.md
+dataset.zip

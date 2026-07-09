@@ -9,8 +9,10 @@ device_map="auto", which only splits one model across cards and runs serially.
 Kaggle quickstart (2x T4):
   !pip install -r requirements.txt
   !git clone <your-repo> MyClone && cd MyClone
-  !accelerate launch --multi_gpu --num_processes 2 train.py \
-      --dataset /kaggle/input/YOUR_DATASET/sft
+  # Use torchrun, NOT `accelerate launch` — on Kaggle the accelerate CLI imports
+  # timm/torchvision at startup and dies on version skew before training runs.
+  # train.py reads torchrun's env via accelerate.PartialState() all the same.
+  !torchrun --nproc_per_node=2 train.py --dataset /kaggle/input/YOUR_DATASET/sft
 
 Single GPU (falls back automatically):
   !python train.py --dataset /kaggle/input/YOUR_DATASET/sft

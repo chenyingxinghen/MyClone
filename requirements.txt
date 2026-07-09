@@ -8,6 +8,12 @@ bitsandbytes>=0.44.0
 accelerate>=1.0.0
 datasets>=3.0.0
 
+# Kaggle/Colab troubleshooting: if importing PEFT/TRL fails with
+# "Could not import module 'BloomPreTrainedModel'" and the full traceback
+# mentions torchvision or `torchvision::nms`, remove the mismatched vision
+# packages before training:
+#   pip uninstall -y torchvision timm
+
 # Optional fast kernels for Qwen3.5's Gated DeltaNet (linear-attention) layers.
 # Require Ampere+ (CC>=8.0); on Turing (T4) the model falls back to slow PyTorch
 # ops. Install only if your GPU supports them:
