@@ -201,9 +201,14 @@ def main():
         f"= {args.batch_size * args.grad_accum * state.num_processes}")
     log(f"Output: {output_dir}\n")
 
+    # SFTConfig's sequence-length arg was renamed max_seq_length -> max_length
+    # in newer TRL (>=0.20). Pass whichever the installed version accepts.
+    import inspect
+    sft_params = inspect.signature(SFTConfig.__init__).parameters
+    seq_len_kwarg = "max_seq_length" if "max_seq_length" in sft_params else "max_length"
+
     sft_config = SFTConfig(
         dataset_text_field="text",
-        max_seq_length=MAX_SEQ_LENGTH,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         num_train_epochs=args.epochs,
@@ -224,6 +229,7 @@ def main():
         ddp_find_unused_parameters=False,
         dataset_num_proc=1,
         report_to="none",
+        **{seq_len_kwarg: MAX_SEQ_LENGTH},
     )
 
     trainer = build_trainer(model, tokenizer, dataset, sft_config)
