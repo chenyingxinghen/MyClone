@@ -92,14 +92,52 @@ def generate_test(model, tokenizer, prompts):
         print(f"Model: {reply.strip()}")
 
 
-def build_trainer(model, tokenizer, dataset, sft_config):
-    """SFTTrainer's tokenizer kwarg was renamed to processing_class; support both."""
+def load_tokenizer(model_id, log):
+    """Return a plain text tokenizer.
+
+    Qwen3.5 and other VLMs may resolve to a multimodal *processor*, which wraps
+    the tokenizer. Passing that straight to SFTTrainer makes apply_chat_template
+    treat string content as vision dicts and crash, so unwrap to `.tokenizer`.
+    """
+    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    if not hasattr(tok, "apply_chat_template") and hasattr(tok, "tokenizer"):
+        log("Loaded a multimodal processor; using its inner text tokenizer")
+        return tok.tokenizer
+    return tok
+
+
+def load_base_model(model_id, bnb_config, local_rank, log):
+    """Load the 4-bit base model onto THIS process's GPU.
+
+    Qwen2/Qwen3 dense text models are plain CausalLM. Qwen3.5 (and other VLMs)
+    ship as `*ForConditionalGeneration`, which is NOT in the CausalLM auto-map —
+    from_pretrained raises ValueError. Fall back to the image-text-to-text class;
+    LoRA still targets the q/k/v/o + gate/up/down projections in its text stack.
+    """
+    common = dict(
+        quantization_config=bnb_config,
+        # Pin the whole model to THIS process's GPU — required for DDP.
+        device_map={"": local_rank},
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+    )
     try:
-        return SFTTrainer(model=model, train_dataset=dataset,
-                          processing_class=tokenizer, args=sft_config)
+        return AutoModelForCausalLM.from_pretrained(model_id, **common)
+    except (ValueError, KeyError) as e:
+        log(f"CausalLM load failed ({type(e).__name__}: {e}); "
+            f"retrying with AutoModelForImageTextToText (VLM path)")
+        from transformers import AutoModelForImageTextToText
+        return AutoModelForImageTextToText.from_pretrained(model_id, **common)
+
+
+def build_trainer(model, tokenizer, train_dataset, eval_dataset, sft_config, callbacks):
+    """SFTTrainer's tokenizer kwarg was renamed to processing_class; support both."""
+    common = dict(model=model, train_dataset=train_dataset,
+                  eval_dataset=eval_dataset, args=sft_config, callbacks=callbacks)
+    try:
+        return SFTTrainer(processing_class=tokenizer, **common)
     except TypeError:
-        return SFTTrainer(model=model, train_dataset=dataset,
-                          tokenizer=tokenizer, args=sft_config)
+        return SFTTrainer(tokenizer=tokenizer, **common)
 
 
 def main():
@@ -108,11 +146,22 @@ def main():
                         help="Directory containing sft-my.json")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3.5-9B")
     parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--eval-ratio", type=float, default=0.05,
+                        help="Fraction held out for validation (0 disables eval).")
+    parser.add_argument("--eval-steps", type=int, default=50,
+                        help="Run validation every N steps (also the save cadence).")
+    parser.add_argument("--early-stopping-patience", type=int, default=3,
+                        help="Stop after N evals without val-loss improvement.")
+    parser.add_argument("--no-assistant-only-loss", action="store_true",
+                        help="Train on all tokens instead of masking user/system "
+                             "turns. Use this if assistant-only loss errors on the "
+                             "model's chat template.")
     parser.add_argument("--test-prompts", type=str, nargs="*", default=[
         "你平时喜欢做什么？",
         "今天心情怎么样？",
@@ -147,17 +196,10 @@ def main():
     )
 
     log(f"Loading model: {args.model} (4-bit QLoRA on GPU {local_rank})")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        quantization_config=bnb_config,
-        # Pin the whole model to THIS process's GPU — required for DDP.
-        device_map={"": local_rank},
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-    )
+    model = load_base_model(args.model, bnb_config, local_rank, log)
     model.config.use_cache = False
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = load_tokenizer(args.model, log)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -165,7 +207,7 @@ def main():
     peft_config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_rank,
-        lora_dropout=0,
+        lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=[
@@ -177,6 +219,14 @@ def main():
     if is_main:
         model.print_trainable_parameters()
 
+    # Assistant-only loss: mask user/system tokens so the model only learns to
+    # imitate the assistant's replies — the whole point of style cloning. Needs
+    # a TRL new enough to accept `assistant_only_loss`; for known families
+    # (Qwen3) TRL auto-patches the chat template to emit the assistant mask.
+    import inspect
+    sft_params = inspect.signature(SFTConfig.__init__).parameters
+    use_aol = ("assistant_only_loss" in sft_params) and not args.no_assistant_only_loss
+
     # Pre-render each conversation with the chat template into a "text" column.
     def formatting_func(examples):
         return {"text": [
@@ -184,9 +234,29 @@ def main():
             for m in examples["messages"]
         ]}
 
-    with state.main_process_first():
-        dataset = dataset.map(formatting_func, batched=True,
-                              remove_columns=dataset.column_names)
+    if use_aol:
+        # Keep the conversational `messages` column — SFTTrainer applies the
+        # chat template itself and builds the assistant token mask from it.
+        # Pre-rendering to text would throw away the role boundaries it needs.
+        prepared = dataset
+        log("Assistant-only loss: ON (masking user/system tokens)")
+    else:
+        with state.main_process_first():
+            prepared = dataset.map(formatting_func, batched=True,
+                                   remove_columns=dataset.column_names)
+        log("Assistant-only loss: OFF (training on all tokens)")
+
+    # Hold out a validation split so eval loss can flag overfitting and drive
+    # early stopping. Deterministic seed → identical split on every DDP rank.
+    eval_dataset = None
+    if args.eval_ratio and 0 < args.eval_ratio < 1 and len(prepared) >= 20:
+        split = prepared.train_test_split(test_size=args.eval_ratio, seed=3407)
+        train_dataset, eval_dataset = split["train"], split["test"]
+        log(f"Split: {len(train_dataset)} train / {len(eval_dataset)} eval "
+            f"({args.eval_ratio:.0%} held out)")
+    else:
+        train_dataset = prepared
+        log("Eval disabled (eval-ratio=0 or dataset too small)")
 
     # Before-training sample (main process only, to avoid duplicate output).
     if is_main:
@@ -203,12 +273,39 @@ def main():
 
     # SFTConfig's sequence-length arg was renamed max_seq_length -> max_length
     # in newer TRL (>=0.20). Pass whichever the installed version accepts.
-    import inspect
-    sft_params = inspect.signature(SFTConfig.__init__).parameters
     seq_len_kwarg = "max_seq_length" if "max_seq_length" in sft_params else "max_length"
 
+    extra_cfg = {}
+    if use_aol:
+        extra_cfg["assistant_only_loss"] = True
+    else:
+        # Only meaningful when we pre-rendered a "text" column above.
+        extra_cfg["dataset_text_field"] = "text"
+
+    callbacks = []
+    if eval_dataset is not None:
+        # Evaluate on a schedule and keep the checkpoint with the lowest val
+        # loss — the overfitting guardrail the previous run lacked. save/eval
+        # strategy + steps must match for load_best_model_at_end.
+        eval_every = max(10, args.eval_steps)
+        extra_cfg.update(
+            eval_strategy="steps",
+            eval_steps=eval_every,
+            save_strategy="steps",
+            save_steps=eval_every,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            per_device_eval_batch_size=args.batch_size,
+        )
+        if args.early_stopping_patience > 0:
+            from transformers import EarlyStoppingCallback
+            callbacks.append(EarlyStoppingCallback(
+                early_stopping_patience=args.early_stopping_patience))
+    else:
+        extra_cfg.update(save_strategy="steps", save_steps=100)
+
     sft_config = SFTConfig(
-        dataset_text_field="text",
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         num_train_epochs=args.epochs,
@@ -217,7 +314,6 @@ def main():
         lr_scheduler_type="cosine",
         weight_decay=0.1,
         logging_steps=10,
-        save_steps=100,
         save_total_limit=2,
         output_dir=output_dir,
         optim="paged_adamw_8bit",
@@ -229,10 +325,12 @@ def main():
         ddp_find_unused_parameters=False,
         dataset_num_proc=1,
         report_to="none",
+        **extra_cfg,
         **{seq_len_kwarg: MAX_SEQ_LENGTH},
     )
 
-    trainer = build_trainer(model, tokenizer, dataset, sft_config)
+    trainer = build_trainer(model, tokenizer, train_dataset, eval_dataset,
+                            sft_config, callbacks)
     trainer.train()
 
     # Save + after-training sample on main process only (DDP-safe).

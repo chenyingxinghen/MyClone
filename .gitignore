@@ -6,3 +6,6 @@ __pycache__/
 dataset/*
 claude.md
 config.json
+kaggle_output/*
+kaggle_output-v1-overfitted.zip
+Modelfile

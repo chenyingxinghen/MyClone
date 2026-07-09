@@ -61,6 +61,13 @@ QA_WINDOW = _cfg.get("qa_match_time_window", 10) * 60
 MAX_MSG_LEN = _cfg.get("max_message_length", 2048)
 MIN_TURNS = _cfg.get("min_turns", 2)
 MIN_CHARS = _cfg.get("min_total_chars", 4)
+# Cap how many consecutive messages get glued into a single turn. Without this,
+# a burst of connected messages becomes one giant multi-line reply and the model
+# learns to fire off run-on message walls. 4 keeps replies natural.
+MAX_COMBINE = _cfg.get("max_combine_messages", 4)
+
+# Aggregated diagnostics, printed at the end so nothing is dropped silently.
+DROP_STATS = {"burst_msgs_dropped": 0, "bursts_capped": 0}
 EXCLUDE_CONTACTS = set(_cfg.get("exclude_contacts", ["文件传输助手"]))
 BLOCKED_WORDS: list = _cfg.get("blocked_words", [])
 QQ_SELF_QQ: int = _cfg.get("qq_self_qq", 0)
@@ -288,6 +295,13 @@ def group_consecutive(
         return []
 
     def combine(group: List[ChatMessage]) -> ChatMessage:
+        # Cap the run at MAX_COMBINE messages so a long burst becomes a natural
+        # short reply, not a wall of glued lines. Overflow is counted (see
+        # DROP_STATS) rather than dropped silently.
+        if len(group) > MAX_COMBINE:
+            DROP_STATS["burst_msgs_dropped"] += len(group) - MAX_COMBINE
+            DROP_STATS["bursts_capped"] += 1
+            group = group[:MAX_COMBINE]
         base = group[0]
         text = base.msg
         for m in group[1:]:
@@ -340,88 +354,109 @@ def generate_qa(
     messages: List[Union[ChatMessage, CutMessage]],
     relation: str,
 ) -> List[dict]:
-    """Generate multi-turn QA pairs from grouped messages."""
+    """Build strictly alternating user→assistant conversations.
+
+    Uses two buffers (user side, assistant side). A completed (user, assistant)
+    pair is only committed when the *next* user message arrives, at a time gap,
+    or at a CutMessage/flush. This guarantees:
+      * every conversation alternates user, assistant, user, assistant, ...
+      * a real question always precedes its answer (no "answer→question" skew)
+      * self-initiated bursts get a synthetic <begin_chat> user turn
+      * no turn exceeds MAX_COMBINE glued messages
+    """
     results: List[dict] = []
-    conv: List[dict] = []
-    conv_talker = ""
+    conv: List[dict] = []      # committed, strictly alternating turns
+    ubuf: List[str] = []       # buffered consecutive other-person (user) msgs
+    abuf: List[str] = []       # buffered consecutive self (assistant) msgs
     last_time: Optional[datetime] = None
-    pending_user: Optional[str] = None
+
+    def buf_lines(buf: List[str]) -> int:
+        return sum(s.count("\n") + 1 for s in buf)
+
+    def add(buf: List[str], text: str):
+        """Append to a turn buffer, hard-capping total lines at MAX_COMBINE."""
+        if not text:
+            return
+        avail = MAX_COMBINE - buf_lines(buf)
+        if avail <= 0:
+            return
+        lines = text.split("\n")
+        buf.append("\n".join(lines[:avail]))
+
+    def commit_pair():
+        """Freeze the current user+assistant buffers into one Q&A pair."""
+        if abuf:  # only a real answer yields a training pair
+            user_text = "\n".join(ubuf) if ubuf else "<begin_chat>"
+            asst_text = "\n".join(abuf)
+            if len(user_text) > MAX_MSG_LEN:
+                user_text = user_text[:MAX_MSG_LEN]
+            if len(asst_text) > MAX_MSG_LEN:
+                asst_text = asst_text[:MAX_MSG_LEN]
+            conv.append({"role": "user", "content": user_text})
+            conv.append({"role": "assistant", "content": asst_text})
+        ubuf.clear()
+        abuf.clear()
 
     def flush():
-        nonlocal conv, conv_talker, pending_user
-        if len(conv) < MIN_TURNS:
-            conv, pending_user = [], None
-            return
-        total = sum(len(m["content"]) for m in conv)
-        if total < MIN_CHARS or total > MAX_MSG_LEN:
-            conv, pending_user = [], None
-            return
-        if (len(conv) == 2 and conv[0]["role"] == "user"
-                and conv[0]["content"] == "<begin_chat>"):
-            conv, pending_user = [], None
-            return
+        nonlocal conv
+        commit_pair()
+        try:
+            if len(conv) < MIN_TURNS:
+                return
+            total = sum(len(m["content"]) for m in conv)
+            if total < MIN_CHARS or total > MAX_MSG_LEN:
+                return
+            # A lone self-initiated pair with no real context isn't useful.
+            if (len(conv) == 2 and conv[0]["role"] == "user"
+                    and conv[0]["content"] == "<begin_chat>"):
+                return
 
-        sys_prompt = SYSTEM_PROMPT
-        if relation:
-            sys_prompt += f"\n 对方是你的{relation}，你们正在聊天"
+            sys_prompt = SYSTEM_PROMPT
+            if relation:
+                sys_prompt += f"\n 对方是你的{relation}，你们正在聊天"
 
-        processed = list(conv)
-        for i in range(len(processed) - 1):
-            if (processed[i]["role"] == "user"
-                    and "<begin_chat>" in processed[i]["content"]
-                    and processed[i + 1]["role"] == "assistant"):
-                hint = processed[i + 1]["content"]
-                processed[i] = {
-                    "role": "user",
-                    "content": processed[i]["content"].replace(
-                        "<begin_chat>",
-                        f"<begin_chat>你应该说：{hint}</begin_chat>",
-                    ),
-                }
+            processed = list(conv)
+            for i in range(len(processed) - 1):
+                if (processed[i]["role"] == "user"
+                        and "<begin_chat>" in processed[i]["content"]
+                        and processed[i + 1]["role"] == "assistant"):
+                    hint = processed[i + 1]["content"]
+                    processed[i] = {
+                        "role": "user",
+                        "content": processed[i]["content"].replace(
+                            "<begin_chat>",
+                            f"<begin_chat>你应该说：{hint}</begin_chat>",
+                        ),
+                    }
 
-        results.append({
-            "time": last_time.isoformat() if last_time else None,
-            "messages": processed,
-            "images": [],
-            "system": sys_prompt,
-        })
-        conv, pending_user = [], None
+            results.append({
+                "time": last_time.isoformat() if last_time else None,
+                "messages": processed,
+                "images": [],
+                "system": sys_prompt,
+            })
+        finally:
+            conv = []
 
     for msg in messages:
         if isinstance(msg, CutMessage):
             flush()
             last_time = None
-            conv_talker = ""
             continue
 
-        if msg.is_sender == 0:  # Other person (user)
-            if last_time and not time_close(last_time, msg.create_time, QA_WINDOW):
-                flush()
-                conv_talker = ""
+        # A long silence ends the current conversation.
+        if last_time is not None and not time_close(last_time, msg.create_time, QA_WINDOW):
+            flush()
+            last_time = None
 
-            if pending_user is not None:
-                pending_user += "\n" + msg.msg
-            else:
-                pending_user = msg.msg
+        if msg.is_sender == 0:  # other person → user turn
+            if abuf:            # previous answer is done; a new question begins
+                commit_pair()
+            add(ubuf, msg.msg)
+        else:                   # self → assistant turn
+            add(abuf, msg.msg)
 
-            conv_talker = msg.talker or conv_talker
-            last_time = msg.create_time
-
-        else:  # Self (assistant)
-            if pending_user is not None:
-                conv.append({"role": "user", "content": pending_user})
-                conv.append({"role": "assistant", "content": msg.msg})
-                pending_user = None
-            elif not conv:
-                conv.append({"role": "user", "content": "<begin_chat>"})
-                conv.append({"role": "assistant", "content": msg.msg})
-
-            if last_time and not time_close(last_time, msg.create_time, QA_WINDOW):
-                flush()
-                conv.append({"role": "user", "content": "<begin_chat>"})
-                conv.append({"role": "assistant", "content": msg.msg})
-
-            last_time = msg.create_time
+        last_time = msg.create_time
 
     flush()
     return results
@@ -520,6 +555,12 @@ def main():
             _safe_print(f"    [{cnt}] {sp[:80]}")
 
     _safe_print(f"\nOutput: {output_path}")
+    if DROP_STATS["bursts_capped"]:
+        _safe_print(
+            f"Burst cap (MAX_COMBINE={MAX_COMBINE}): "
+            f"{DROP_STATS['bursts_capped']} runs trimmed, "
+            f"{DROP_STATS['burst_msgs_dropped']} overflow messages dropped."
+        )
     _safe_print("Upload dataset/ folder to Kaggle for training.")
 
 
