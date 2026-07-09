@@ -343,7 +343,11 @@ def main():
         output_dir=output_dir,
         optim="paged_adamw_8bit",
         seed=3407,
-        fp16=True,
+        # The model and bitsandbytes compute already run in fp16. Keep Trainer
+        # AMP off so Accelerate does not create a GradScaler; some Kaggle
+        # torch/PEFT stacks surface bf16 adapter grads, and GradScaler cannot
+        # unscale bf16 CUDA gradients.
+        fp16=False,
         bf16=False,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
