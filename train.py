@@ -142,6 +142,28 @@ def build_trainer(model, tokenizer, train_dataset, eval_dataset, sft_config, cal
         return SFTTrainer(tokenizer=tokenizer, **common)
 
 
+def cast_trainable_params_to_fp32(model, log):
+    """Keep GradScaler away from bf16/fp16 LoRA gradients.
+
+    Some model/PEFT combinations initialize adapter weights in the base model's
+    dtype (often bf16). fp16 training uses GradScaler, whose CUDA unscale kernel
+    does not accept bf16 gradients. Casting only trainable adapter params to fp32
+    is the standard QLoRA stability path and leaves the frozen 4-bit base alone.
+    """
+    counts = {}
+    casted = 0
+    for _, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        counts[str(param.dtype)] = counts.get(str(param.dtype), 0) + param.numel()
+        if param.dtype in (torch.float16, torch.bfloat16):
+            param.data = param.data.float()
+            casted += param.numel()
+    if casted:
+        log(f"Casted {casted:,} trainable adapter parameters to fp32 "
+            f"to avoid AMP unscale dtype errors. Original trainable dtypes: {counts}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default=None,
@@ -218,6 +240,7 @@ def main():
         ],
     )
     model = get_peft_model(model, peft_config)
+    cast_trainable_params_to_fp32(model, log)
     if is_main:
         model.print_trainable_parameters()
 
