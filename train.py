@@ -14,6 +14,12 @@ Kaggle quickstart (2x T4):
   # train.py reads torchrun's env via accelerate.PartialState() all the same.
   !torchrun --nproc_per_node=2 train.py --dataset /kaggle/input/YOUR_DATASET/sft
 
+Big model that won't fit one 16GB T4 (e.g. Qwen3.5-9B) — shard across both cards:
+  # ONE process, model-parallel (device_map="auto"). Do NOT use torchrun here.
+  !python train.py --model-parallel --model Qwen/Qwen3.5-9B \
+      --dataset /kaggle/input/YOUR_DATASET/sft
+  # Fits by pooling ~32GB, but GPUs run serially (no throughput speedup).
+
 Single GPU (falls back automatically):
   !python train.py --dataset /kaggle/input/YOUR_DATASET/sft
 """
@@ -74,16 +80,64 @@ def load_sft_dataset(dataset_dir):
     return Dataset.from_list(conversations)
 
 
-def generate_test(model, tokenizer, prompts):
+def get_dataset_system_prompt(dataset):
+    if not len(dataset):
+        return None
+    for msg in dataset[0].get("messages", []):
+        if msg.get("role") == "system" and msg.get("content"):
+            return msg["content"]
+    return None
+
+
+_THINKING_KW_WARNED = False
+
+
+def render_chat(tokenizer, messages, add_generation_prompt):
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=False,
+        )
+    except TypeError:
+        # Older/other templates don't accept enable_thinking. Warn once so the
+        # revert isn't silent — think-suppression then relies solely on the empty
+        # <think></think> blocks baked into the training data by process_data.py.
+        global _THINKING_KW_WARNED
+        if not _THINKING_KW_WARNED:
+            print("WARNING: apply_chat_template does not accept enable_thinking; "
+                  "relying on trained empty-think blocks to keep thinking OFF.")
+            _THINKING_KW_WARNED = True
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+
+
+def strip_thinking(reply):
+    # Peel off any leading think blocks (a prefilled empty one plus, defensively,
+    # one the model may still emit) so only the final reply is shown.
+    text = reply.strip()
+    while text.startswith("<think>") and "</think>" in text:
+        text = text.split("</think>", 1)[1].strip()
+    return text
+
+
+def generate_test(model, tokenizer, prompts, system_prompt=None, max_new_tokens=64):
     model.eval()
     for prompt in prompts:
-        msgs = [{"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        msgs = []
+        if system_prompt:
+            msgs.append({"role": "system", "content": system_prompt})
+        msgs.append({"role": "user", "content": prompt})
+        text = render_chat(tokenizer, msgs, add_generation_prompt=True)
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=128,
+                max_new_tokens=max_new_tokens,
                 temperature=0.7,
                 do_sample=True,
                 top_p=0.9,
@@ -91,7 +145,7 @@ def generate_test(model, tokenizer, prompts):
             )
         reply = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
         print(f"\nUser: {prompt}")
-        print(f"Model: {reply.strip()}")
+        print(f"Model: {strip_thinking(reply)}")
 
 
 def load_tokenizer(model_id, log):
@@ -108,18 +162,21 @@ def load_tokenizer(model_id, log):
     return tok
 
 
-def load_base_model(model_id, bnb_config, local_rank, log):
-    """Load the 4-bit base model onto THIS process's GPU.
+def load_base_model(model_id, bnb_config, device_map, log):
+    """Load the 4-bit base model.
 
     Qwen2/Qwen3 dense text models are plain CausalLM. Qwen3.5 (and other VLMs)
     ship as `*ForConditionalGeneration`, which is NOT in the CausalLM auto-map —
     from_pretrained raises ValueError. Fall back to the image-text-to-text class;
     LoRA still targets the q/k/v/o + gate/up/down projections in its text stack.
+
+    device_map is either {"": local_rank} (DDP: full model per GPU) or "auto"
+    (model-parallel: one model sharded across all GPUs, for models too big for
+    a single card).
     """
     common = dict(
         quantization_config=bnb_config,
-        # Pin the whole model to THIS process's GPU — required for DDP.
-        device_map={"": local_rank},
+        device_map=device_map,
         trust_remote_code=True,
         torch_dtype=torch.float16,
     )
@@ -186,10 +243,23 @@ def main():
                         help="Train on all tokens instead of masking user/system "
                              "turns. Use this if assistant-only loss errors on the "
                              "model's chat template.")
+    parser.add_argument("--model-parallel", action="store_true",
+                        help="Shard ONE model across all visible GPUs "
+                             "(device_map='auto') instead of DDP. Use for models "
+                             "too big for a single 16GB T4 (e.g. Qwen3.5-9B). "
+                             "Slower (GPUs run serially) but fits. Run with plain "
+                             "`python train.py` — do NOT use torchrun/accelerate "
+                             "launch, which would spawn conflicting processes.")
+    parser.add_argument("--system-prompt", type=str, default=None,
+                        help="System prompt used for before/after test generation. "
+                             "Defaults to the first dataset system prompt.")
+    parser.add_argument("--test-max-new-tokens", type=int, default=64,
+                        help="Max new tokens for before/after test generations.")
     parser.add_argument("--test-prompts", type=str, nargs="*", default=[
-        "你平时喜欢做什么？",
-        "今天心情怎么样？",
-        "帮我推荐一部电影吧",
+        "没有",
+        "在干嘛",
+        "今天累死了",
+        "周末有空吗",
     ], help="Test prompts for before/after comparison")
     args = parser.parse_args()
 
@@ -208,8 +278,32 @@ def main():
     output_dir = args.output or ("/kaggle/working/output" if is_kaggle else "./output")
 
     dataset = load_sft_dataset(dataset_dir)
+    test_system_prompt = args.system_prompt or get_dataset_system_prompt(dataset)
     log(f"Loaded {len(dataset)} conversations from {dataset_dir}")
     log(f"World size: {state.num_processes} GPU(s)")
+    if test_system_prompt:
+        log(f"Test system prompt: {test_system_prompt}")
+
+    # Two ways to use 2x T4:
+    #   DDP (default)           — device_map={"": rank}: a FULL model per GPU.
+    #                             Real throughput scaling, but each card must fit
+    #                             the whole model. 9B in 4-bit + activations OOMs
+    #                             a single 16GB T4.
+    #   Model-parallel (--model-parallel) — device_map="auto": ONE model sharded
+    #                             across both cards (~32GB pooled). Fits 9B, but
+    #                             runs serially (no speedup). Single process only.
+    if args.model_parallel:
+        if state.num_processes > 1:
+            print("ERROR: --model-parallel needs a single process, but "
+                  f"{state.num_processes} were launched. Run `python train.py "
+                  "--model-parallel ...` directly — not under torchrun/accelerate "
+                  "launch (each process would grab all GPUs and OOM).")
+            sys.exit(1)
+        device_map = "auto"
+        log("Model-parallel: sharding one model across all visible GPUs "
+            "(serial, no throughput speedup, but fits big models).")
+    else:
+        device_map = {"": local_rank}
 
     # 4-bit NF4 quantization. T4 (Turing) has no bf16 → fp16 compute.
     bnb_config = BitsAndBytesConfig(
@@ -219,8 +313,8 @@ def main():
         bnb_4bit_compute_dtype=torch.float16,
     )
 
-    log(f"Loading model: {args.model} (4-bit QLoRA on GPU {local_rank})")
-    model = load_base_model(args.model, bnb_config, local_rank, log)
+    log(f"Loading model: {args.model} (4-bit QLoRA, device_map={device_map})")
+    model = load_base_model(args.model, bnb_config, device_map, log)
     model.config.use_cache = False
 
     tokenizer = load_tokenizer(args.model, log)
@@ -255,7 +349,7 @@ def main():
     # Pre-render each conversation with the chat template into a "text" column.
     def formatting_func(examples):
         return {"text": [
-            tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=False)
+            render_chat(tokenizer, m, add_generation_prompt=False)
             for m in examples["messages"]
         ]}
 
@@ -288,7 +382,8 @@ def main():
         print("\n" + "=" * 60)
         print("BEFORE TRAINING - Test generations")
         print("=" * 60)
-        generate_test(model, tokenizer, args.test_prompts)
+        generate_test(model, tokenizer, args.test_prompts,
+                      test_system_prompt, args.test_max_new_tokens)
 
     log(f"\nTraining: {args.epochs} epochs, per-device bs={args.batch_size}x{args.grad_accum}, "
         f"lr={args.lr}, rank={args.lora_rank}")
@@ -367,7 +462,8 @@ def main():
         print("\n" + "=" * 60)
         print("AFTER TRAINING - Test generations")
         print("=" * 60)
-        generate_test(model, tokenizer, args.test_prompts)
+        generate_test(model, tokenizer, args.test_prompts,
+                      test_system_prompt, args.test_max_new_tokens)
 
         model.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)

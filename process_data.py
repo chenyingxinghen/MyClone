@@ -66,6 +66,14 @@ MIN_CHARS = _cfg.get("min_total_chars", 4)
 # learns to fire off run-on message walls. 4 keeps replies natural.
 MAX_COMBINE = _cfg.get("max_combine_messages", 4)
 
+# Qwen3/Qwen3.5 are reasoning models: at inference they emit a <think>...</think>
+# block before the reply. Chat data has no chain-of-thought, so we bake an EMPTY
+# think block into every assistant turn. The model then learns "after the
+# assistant header, emit an empty think, then reply" — thinking is stably OFF and
+# the reply matches your style. Toggle off for non-reasoning base models.
+ADD_EMPTY_THINK = _cfg.get("add_empty_think", True)
+EMPTY_THINK = "<think>\n\n</think>\n\n"
+
 # Aggregated diagnostics, printed at the end so nothing is dropped silently.
 DROP_STATS = {"burst_msgs_dropped": 0, "bursts_capped": 0}
 EXCLUDE_CONTACTS = set(_cfg.get("exclude_contacts", ["文件传输助手"]))
@@ -428,6 +436,16 @@ def generate_qa(
                             f"<begin_chat>你应该说：{hint}</begin_chat>",
                         ),
                     }
+
+            # Bake an empty think block into each assistant turn — done last so
+            # the <begin_chat> hint above stays free of think tags and the char
+            # filters above measure real content, not the boilerplate prefix.
+            if ADD_EMPTY_THINK:
+                processed = [
+                    {"role": m["role"], "content": EMPTY_THINK + m["content"]}
+                    if m["role"] == "assistant" else m
+                    for m in processed
+                ]
 
             results.append({
                 "time": last_time.isoformat() if last_time else None,
