@@ -12,3 +12,10 @@ dataset.zip
 kaggle*/
 *.zip
 *cache
+data/raw-chat-history/
+data/dataset/
+model_process/*.gguf
+model_process/base_model_cache/
+model_process/llama.cpp-src/
+eval-report*.json
+.tmp*

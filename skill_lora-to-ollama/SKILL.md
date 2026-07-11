@@ -8,6 +8,33 @@ version: 1.0.0
 
 将 LoRA adapter（safetensors/bin 格式）合并到基座模型，转换为 GGUF，量化后导入 Ollama 本地推理。
 
+## 多模态模型警告（Qwen3.5-VL 等）
+
+下面“合并完整模型再转 GGUF”的传统流程只适合纯文本模型。对带视觉塔的模型这样做，转换器可能只导出语言部分：模型参数量会变小，`ollama show` 中的 `vision` 能力也会消失。
+
+多模态模型必须保留 Ollama 原始视觉基座，只转换和挂载 LoRA：
+
+```powershell
+python llama.cpp-src/convert_lora_to_gguf.py ./adapter `
+  --base ./base_model `
+  --outfile ./adapter-f16.gguf `
+  --outtype f16
+```
+
+```dockerfile
+FROM qwen3.5:9b
+ADAPTER ./adapter-f16.gguf
+PARAMETER num_ctx 65536
+PARAMETER temperature 0.4
+```
+
+```powershell
+ollama create myclone-vl -f Modelfile
+ollama show myclone-vl
+```
+
+最终 `Capabilities` 必须包含 `vision`。Ollama 的 Safetensors LoRA 导入目前不直接支持 Qwen，因此先用 llama.cpp 转成 GGUF adapter；不要把整个 VLM 合并成单一语言 GGUF。
+
 ## 前置条件
 
 - Python 3.11+（3.13 也支持）、Ollama 已安装
@@ -55,7 +82,7 @@ print(f'Downloaded to: {model_dir}')
 
 方案 3 - HuggingFace 直连：`huggingface-cli download Qwen/Qwen2.5-7B-Instruct --local-dir ./base_model`
 
-## Step 3: 合并 LoRA Adapter
+## Step 3: 合并 LoRA Adapter（仅纯文本基座）
 
 ```python
 import gc, torch

@@ -20,6 +20,9 @@ import json
 import os
 import re
 import sys
+import hashlib
+import html
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -52,9 +55,17 @@ def load_config() -> dict:
 
 
 _cfg = load_config()
+PROJECT_DIR = Path(__file__).resolve().parent
 
-RAW_DATA_DIR = Path(_cfg.get("raw_data_dir", "../WeClone/my-chat-history"))
-OUTPUT_DIR = Path(_cfg.get("output_dir", "./dataset"))
+
+def _project_path(value: str) -> Path:
+    """Resolve config paths from the repository, not the caller's cwd."""
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (PROJECT_DIR / path).resolve()
+
+
+RAW_DATA_DIR = _project_path(_cfg.get("raw_data_dir", "./data/raw-chat-history"))
+OUTPUT_DIR = _project_path(_cfg.get("output_dir", "./data/dataset"))
 SYSTEM_PROMPT = _cfg.get("system_prompt", "请你扮演一名人类，不要说自己是人工智能")
 COMBINE_WINDOW = _cfg.get("combine_time_window", 10) * 60
 QA_WINDOW = _cfg.get("qa_match_time_window", 10) * 60
@@ -65,6 +76,10 @@ MIN_CHARS = _cfg.get("min_total_chars", 4)
 # a burst of connected messages becomes one giant multi-line reply and the model
 # learns to fire off run-on message walls. 4 keeps replies natural.
 MAX_COMBINE = _cfg.get("max_combine_messages", 4)
+INCLUDE_SELF_INITIATED = bool(_cfg.get("include_self_initiated", False))
+DEDUPLICATE_CONVERSATIONS = bool(_cfg.get("deduplicate_conversations", True))
+MAX_SHORT_REPLY_CHARS = int(_cfg.get("max_short_reply_chars", 4))
+MAX_SHORT_REPLY_OCCURRENCES = int(_cfg.get("max_short_reply_occurrences", 30))
 
 # Qwen3/Qwen3.5 are reasoning models: at inference they emit a <think>...</think>
 # block before the reply. Chat data has no chain-of-thought, so we bake an EMPTY
@@ -75,7 +90,23 @@ ADD_EMPTY_THINK = _cfg.get("add_empty_think", True)
 EMPTY_THINK = "<think>\n\n</think>\n\n"
 
 # Aggregated diagnostics, printed at the end so nothing is dropped silently.
-DROP_STATS = {"burst_msgs_dropped": 0, "bursts_capped": 0}
+DROP_STATS = {
+    "burst_msgs_trimmed": 0,
+    "bursts_capped": 0,
+    "self_initiated_pairs": 0,
+    "duplicate_conversations": 0,
+    "frequent_short_reply_pairs": 0,
+    "empty_conversations_after_filter": 0,
+    "media_placeholder_cuts": 0,
+    "sanitized_text_messages_cut": 0,
+    "export_artifact_messages_cut": 0,
+    "artifact_tokens_removed": 0,
+    "quote_suffixes_removed": 0,
+    "mention_lines_removed": 0,
+    "sensitive_messages_cut": 0,
+    "copied_user_pairs_removed": 0,
+    "residual_artifact_pairs_removed": 0,
+}
 EXCLUDE_CONTACTS = set(_cfg.get("exclude_contacts", ["文件传输助手"]))
 BLOCKED_WORDS: list = _cfg.get("blocked_words", [])
 QQ_SELF_QQ: int = _cfg.get("qq_self_qq", 0)
@@ -115,6 +146,84 @@ SYSTEM_MSG_RE = re.compile("|".join([
     r'刚刚把你添加到通讯录',
     r'以上是打招呼的(?:消息|内容)',
 ]))
+
+# Some exporters serialize media as literal text even when type_name says text.
+# Treat these as hard context boundaries so the model does not learn to emit a
+# bare "[图片]" without ever seeing the corresponding image.
+MEDIA_PLACEHOLDER_RE = re.compile(
+    r"\[(?:图片|视频|语音|文件|动画表情|Emoji表情|不支持的消息)\]"
+)
+BRACKET_ARTIFACT_RE = re.compile(r"\[[^\]\n]{1,240}\]")
+QUOTE_MARKER_RE = re.compile(r"\[引用(?:消息|\s)", re.IGNORECASE)
+EXPORT_MESSAGE_RE = re.compile("|".join([
+    r"^\s*\[(?:转发的聊天记录|合并转发|链接|小程序|视频通话|语音通话|通话|Photo)\]",
+    r"Chat History for (?:Group|Private) Chat",
+    r"^\s*【支付宝】",
+]), re.IGNORECASE)
+MENTION_LINE_RE = re.compile(r"^\s*@(?:所有人|\S+)\s*$")
+URL_RE = re.compile(r"(?:https?://|www\.|ur\.alipay\.com/)", re.IGNORECASE)
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+LONG_NUMBER_RE = re.compile(r"(?<!\d)\d{7,}(?!\d)")
+SENSITIVE_KEYWORD_RE = re.compile(
+    r"(?:账号密码|密码|验证码|身份证|银行卡|支付口令|access[_ -]?key|api[_ -]?key|secret|token)",
+    re.IGNORECASE,
+)
+
+
+def contains_sensitive_text(text: str) -> bool:
+    return bool(
+        URL_RE.search(text)
+        or EMAIL_RE.search(text)
+        or LONG_NUMBER_RE.search(text)
+        or SENSITIVE_KEYWORD_RE.search(text)
+    )
+
+
+def sanitize_export_text(value: str) -> Optional[str]:
+    """Remove exporter syntax and reject secrets before building conversations."""
+    text = html.unescape(str(value or ""))
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[\u200b-\u200f\ufeff]", "", text).strip()
+    if not text:
+        return None
+    if contains_sensitive_text(text):
+        DROP_STATS["sensitive_messages_cut"] += 1
+        return None
+    if EXPORT_MESSAGE_RE.search(text):
+        DROP_STATS["export_artifact_messages_cut"] += 1
+        return None
+
+    quote = QUOTE_MARKER_RE.search(text)
+    if quote:
+        text = text[:quote.start()].rstrip()
+        DROP_STATS["quote_suffixes_removed"] += 1
+
+    before = text
+    # Run repeatedly because quote/emoji exports can contain nested brackets.
+    for _ in range(4):
+        text, count = BRACKET_ARTIFACT_RE.subn("", text)
+        DROP_STATS["artifact_tokens_removed"] += count
+        if not count:
+            break
+
+    cleaned_lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if MENTION_LINE_RE.fullmatch(line):
+            DROP_STATS["mention_lines_removed"] += 1
+            continue
+        cleaned_lines.append(line)
+    text = "\n".join(cleaned_lines).strip()
+    if not text:
+        if before:
+            DROP_STATS["export_artifact_messages_cut"] += 1
+        return None
+    if contains_sensitive_text(text):
+        DROP_STATS["sensitive_messages_cut"] += 1
+        return None
+    return text
 
 QQ_TYPE_MAP = {
     (2, 1): "文本", (2, 2): "图片", (2, 3): "图片",
@@ -219,14 +328,22 @@ def load_wechat_contact(
             tn = row["type_name"]
             ct = row["CreateTime"].to_pydatetime()
 
+            raw_text = str(row.get("msg", "")).strip()
+            clean_text = sanitize_export_text(raw_text) if tn == "文本" else None
+
             if tn in CUT_TYPES:
                 all_messages.append(CutMessage(create_time=ct))
-            elif tn == "文本" and str(row.get("msg", "")).strip():
+            elif tn == "文本" and clean_text is None:
+                DROP_STATS["sanitized_text_messages_cut"] += 1
+                DROP_STATS["media_placeholder_cuts"] += bool(
+                    MEDIA_PLACEHOLDER_RE.search(raw_text))
+                all_messages.append(CutMessage(create_time=ct))
+            elif tn == "文本":
                 all_messages.append(ChatMessage(
                     type_name="文本",
                     is_sender=int(row["is_sender"]),
                     talker=str(row.get("talker", "")),
-                    msg=str(row["msg"]).strip(),
+                    msg=clean_text,
                     create_time=ct,
                 ))
 
@@ -275,12 +392,18 @@ def load_qq_chat(
 
         talker = msg.get("sendNickName", "") or str(sender_qq)
 
+        clean_content = sanitize_export_text(content) if tn == "文本" else None
         if tn in CUT_TYPES:
             messages.append(CutMessage(create_time=ct))
-        elif tn == "文本" and content:
+        elif tn == "文本" and clean_content is None:
+            DROP_STATS["sanitized_text_messages_cut"] += 1
+            DROP_STATS["media_placeholder_cuts"] += bool(
+                MEDIA_PLACEHOLDER_RE.search(content))
+            messages.append(CutMessage(create_time=ct))
+        elif tn == "文本":
             messages.append(ChatMessage(
                 type_name="文本", is_sender=is_sender,
-                talker=talker, msg=content, create_time=ct,
+                talker=talker, msg=clean_content, create_time=ct,
             ))
 
     return messages, relation
@@ -303,21 +426,26 @@ def group_consecutive(
         return []
 
     def combine(group: List[ChatMessage]) -> ChatMessage:
-        # Cap the run at MAX_COMBINE messages so a long burst becomes a natural
-        # short reply, not a wall of glued lines. Overflow is counted (see
-        # DROP_STATS) rather than dropped silently.
+        # Cap the run so a long burst does not become a wall of text. Preserve
+        # both the beginning and the conclusion: keeping only the first N
+        # messages used to discard the actual answer when it appeared at the
+        # end of a burst.
         if len(group) > MAX_COMBINE:
-            DROP_STATS["burst_msgs_dropped"] += len(group) - MAX_COMBINE
+            DROP_STATS["burst_msgs_trimmed"] += len(group) - MAX_COMBINE
             DROP_STATS["bursts_capped"] += 1
-            group = group[:MAX_COMBINE]
+            if MAX_COMBINE <= 1:
+                group = [group[-1]]
+            else:
+                indexes = [
+                    round(i * (len(group) - 1) / (MAX_COMBINE - 1))
+                    for i in range(MAX_COMBINE)
+                ]
+                group = [group[i] for i in dict.fromkeys(indexes)]
         base = group[0]
-        text = base.msg
-        for m in group[1:]:
-            if not m.msg:
-                continue
-            if text and text[-1] not in "。.！!？?…，,":
-                text += "\n"
-            text += m.msg
+        # Every source message is a separate chat bubble. Punctuation must not
+        # decide whether that boundary survives: "好。" followed by "等我" is
+        # still two messages and should train as two output lines.
+        text = "\n".join(m.msg for m in group if m.msg)
         if len(text) > MAX_MSG_LEN:
             text = text[:MAX_MSG_LEN]
         return ChatMessage(
@@ -361,6 +489,7 @@ def group_consecutive(
 def generate_qa(
     messages: List[Union[ChatMessage, CutMessage]],
     relation: str,
+    source: str = "",
 ) -> List[dict]:
     """Build strictly alternating user→assistant conversations.
 
@@ -394,14 +523,21 @@ def generate_qa(
     def commit_pair():
         """Freeze the current user+assistant buffers into one Q&A pair."""
         if abuf:  # only a real answer yields a training pair
-            user_text = "\n".join(ubuf) if ubuf else "<begin_chat>"
-            asst_text = "\n".join(abuf)
-            if len(user_text) > MAX_MSG_LEN:
-                user_text = user_text[:MAX_MSG_LEN]
-            if len(asst_text) > MAX_MSG_LEN:
-                asst_text = asst_text[:MAX_MSG_LEN]
-            conv.append({"role": "user", "content": user_text})
-            conv.append({"role": "assistant", "content": asst_text})
+            if ubuf or INCLUDE_SELF_INITIATED:
+                user_text = "\n".join(ubuf) if ubuf else "<begin_chat>"
+                asst_text = "\n".join(abuf)
+                if len(user_text) > MAX_MSG_LEN:
+                    user_text = user_text[:MAX_MSG_LEN]
+                if len(asst_text) > MAX_MSG_LEN:
+                    asst_text = asst_text[:MAX_MSG_LEN]
+                conv.append({"role": "user", "content": user_text})
+                conv.append({"role": "assistant", "content": asst_text})
+            else:
+                # There is no user intent to learn from. The previous pipeline
+                # copied the assistant answer into a synthetic user prompt,
+                # leaking the label and teaching prompt-copying instead of
+                # semantic response behavior.
+                DROP_STATS["self_initiated_pairs"] += 1
         ubuf.clear()
         abuf.clear()
 
@@ -424,22 +560,9 @@ def generate_qa(
                 sys_prompt += f"\n 对方是你的{relation}，你们正在聊天"
 
             processed = list(conv)
-            for i in range(len(processed) - 1):
-                if (processed[i]["role"] == "user"
-                        and "<begin_chat>" in processed[i]["content"]
-                        and processed[i + 1]["role"] == "assistant"):
-                    hint = processed[i + 1]["content"]
-                    processed[i] = {
-                        "role": "user",
-                        "content": processed[i]["content"].replace(
-                            "<begin_chat>",
-                            f"<begin_chat>你应该说：{hint}</begin_chat>",
-                        ),
-                    }
 
-            # Bake an empty think block into each assistant turn — done last so
-            # the <begin_chat> hint above stays free of think tags and the char
-            # filters above measure real content, not the boilerplate prefix.
+            # Bake an empty think block into each assistant turn only after the
+            # quality filters measure real content, not the boilerplate prefix.
             if ADD_EMPTY_THINK:
                 processed = [
                     {"role": m["role"], "content": EMPTY_THINK + m["content"]}
@@ -452,6 +575,7 @@ def generate_qa(
                 "messages": processed,
                 "images": [],
                 "system": sys_prompt,
+                "source": source,
             })
         finally:
             conv = []
@@ -478,6 +602,91 @@ def generate_qa(
 
     flush()
     return results
+
+
+def _plain_assistant_text(text: str) -> str:
+    """Remove the optional empty reasoning wrapper for quality statistics."""
+    return re.sub(r"^<think>\s*</think>\s*", "", text).strip()
+
+
+def rebalance_dataset(rows: List[dict]) -> List[dict]:
+    """Remove label leakage, exact duplicates and dominant tiny replies.
+
+    Very short acknowledgements are valid style data, but hundreds of identical
+    copies make the easiest loss-minimizing behavior answer everything with one
+    character. We keep a deterministic, context-diverse sample instead.
+    """
+    if not rows:
+        return []
+
+    unique_rows: List[dict] = []
+    seen = set()
+    for row in rows:
+        signature = json.dumps(
+            {"messages": row.get("messages", []), "system": row.get("system", "")},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()
+        if DEDUPLICATE_CONVERSATIONS and digest in seen:
+            DROP_STATS["duplicate_conversations"] += 1
+            continue
+        seen.add(digest)
+        unique_rows.append(row)
+
+    buckets = defaultdict(list)
+    for row_idx, row in enumerate(unique_rows):
+        messages = row.get("messages", [])
+        for pair_idx in range(0, len(messages) - 1, 2):
+            user = messages[pair_idx].get("content", "")
+            reply = _plain_assistant_text(messages[pair_idx + 1].get("content", ""))
+            if 0 < len(reply) <= MAX_SHORT_REPLY_CHARS:
+                diversity_key = hashlib.sha256(
+                    f"{row.get('source', '')}\0{row.get('time', '')}\0{user}\0{reply}".encode("utf-8")
+                ).hexdigest()
+                buckets[reply].append((diversity_key, row_idx, pair_idx))
+
+    keep_pairs = set()
+    for entries in buckets.values():
+        if MAX_SHORT_REPLY_OCCURRENCES <= 0 or len(entries) <= MAX_SHORT_REPLY_OCCURRENCES:
+            keep_pairs.update((row_idx, pair_idx) for _, row_idx, pair_idx in entries)
+            continue
+        chosen = sorted(entries)[:MAX_SHORT_REPLY_OCCURRENCES]
+        keep_pairs.update((row_idx, pair_idx) for _, row_idx, pair_idx in chosen)
+
+    balanced: List[dict] = []
+    for row_idx, row in enumerate(unique_rows):
+        messages = row.get("messages", [])
+        filtered = []
+        for pair_idx in range(0, len(messages) - 1, 2):
+            user = messages[pair_idx].get("content", "").strip()
+            reply = _plain_assistant_text(messages[pair_idx + 1].get("content", ""))
+            residual_artifact = bool(
+                BRACKET_ARTIFACT_RE.search(user)
+                or BRACKET_ARTIFACT_RE.search(reply)
+                or any(MENTION_LINE_RE.fullmatch(line.strip())
+                       for line in reply.splitlines())
+                or contains_sensitive_text(user)
+                or contains_sensitive_text(reply)
+            )
+            if residual_artifact:
+                DROP_STATS["residual_artifact_pairs_removed"] += 1
+                continue
+            if len(user) >= 4 and user in reply:
+                DROP_STATS["copied_user_pairs_removed"] += 1
+                continue
+            is_short = 0 < len(reply) <= MAX_SHORT_REPLY_CHARS
+            if is_short and (row_idx, pair_idx) not in keep_pairs:
+                DROP_STATS["frequent_short_reply_pairs"] += 1
+                continue
+            filtered.extend(messages[pair_idx:pair_idx + 2])
+        if len(filtered) >= MIN_TURNS:
+            clean_row = dict(row)
+            clean_row["messages"] = filtered
+            balanced.append(clean_row)
+        else:
+            DROP_STATS["empty_conversations_after_filter"] += 1
+    return balanced
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -509,7 +718,7 @@ def main():
                 continue
 
             grouped = group_consecutive(messages)
-            qa_pairs = generate_qa(grouped, relation)
+            qa_pairs = generate_qa(grouped, relation, source=f"wechat:{name}")
             _safe_print(f"  {name}: {len(messages)} msgs -> {len(grouped)} grouped -> {len(qa_pairs)} QA")
             all_qa.extend(qa_pairs)
 
@@ -523,9 +732,12 @@ def main():
                 if not messages:
                     continue
                 grouped = group_consecutive(messages)
-                qa_pairs = generate_qa(grouped, relation)
+                qa_pairs = generate_qa(grouped, relation, source=f"qq:{f.stem}")
                 _safe_print(f"  {f.stem}: {len(messages)} msgs -> {len(qa_pairs)} QA")
                 all_qa.extend(qa_pairs)
+
+    raw_pair_count = sum(len(q.get("messages", [])) // 2 for q in all_qa)
+    all_qa = rebalance_dataset(all_qa)
 
     # Assign IDs and save
     for i, qa in enumerate(all_qa):
@@ -556,9 +768,40 @@ def main():
     with open(sft_dir / "dataset_info.json", "w", encoding="utf-8") as f:
         json.dump(dataset_info, f, ensure_ascii=False, indent=4)
 
+    assistant_replies = [
+        _plain_assistant_text(message["content"])
+        for row in all_qa
+        for message in row["messages"]
+        if message["role"] == "assistant"
+    ]
+    multiline_count = sum("\n" in reply for reply in assistant_replies)
+    quality_report = {
+        "conversations": len(all_qa),
+        "qa_pairs_before_rebalance": raw_pair_count,
+        "qa_pairs_after_rebalance": sum(len(q["messages"]) // 2 for q in all_qa),
+        "rows_with_images": sum(bool(q.get("images")) for q in all_qa),
+        "assistant_reply_structure": {
+            "total": len(assistant_replies),
+            "multiline": multiline_count,
+            "multiline_ratio": round(multiline_count / len(assistant_replies), 4)
+            if assistant_replies else 0,
+            "three_or_more_lines": sum(reply.count("\n") >= 2 for reply in assistant_replies),
+            "max_lines": max((reply.count("\n") + 1 for reply in assistant_replies), default=0),
+        },
+        "config": {
+            "include_self_initiated": INCLUDE_SELF_INITIATED,
+            "deduplicate_conversations": DEDUPLICATE_CONVERSATIONS,
+            "max_short_reply_chars": MAX_SHORT_REPLY_CHARS,
+            "max_short_reply_occurrences": MAX_SHORT_REPLY_OCCURRENCES,
+        },
+        "dropped": DROP_STATS,
+    }
+    with open(sft_dir / "quality-report.json", "w", encoding="utf-8") as f:
+        json.dump(quality_report, f, ensure_ascii=False, indent=2)
+
     # Stats
     _safe_print(f"\n{'=' * 50}")
-    _safe_print(f"Total QA pairs: {len(all_qa)}")
+    _safe_print(f"Total conversations: {len(all_qa)}")
     if all_qa:
         turns = [len(q["messages"]) for q in all_qa]
         chars = [sum(len(m["content"]) for m in q["messages"]) for q in all_qa]
@@ -577,8 +820,16 @@ def main():
         _safe_print(
             f"Burst cap (MAX_COMBINE={MAX_COMBINE}): "
             f"{DROP_STATS['bursts_capped']} runs trimmed, "
-            f"{DROP_STATS['burst_msgs_dropped']} overflow messages dropped."
+            f"{DROP_STATS['burst_msgs_trimmed']} overflow messages omitted "
+            "while preserving the beginning and end of each burst."
         )
+    _safe_print(
+        "Quality filters: "
+        f"self-initiated={DROP_STATS['self_initiated_pairs']}, "
+        f"duplicate conversations={DROP_STATS['duplicate_conversations']}, "
+        f"frequent short replies={DROP_STATS['frequent_short_reply_pairs']}, "
+        f"media placeholder cuts={DROP_STATS['media_placeholder_cuts']}"
+    )
     _safe_print("Upload dataset/ folder to Kaggle for training.")
 
 

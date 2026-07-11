@@ -1,0 +1,51 @@
+[
+  {
+    "id": "negation",
+    "goal": "理解否定，不把‘没生气’回答成承认生气",
+    "messages": [
+      {"role": "user", "content": "我其实没生气，对方误会了，我该怎么简短解释？"}
+    ]
+  },
+  {
+    "id": "context_followup",
+    "goal": "理解多轮省略和时间指代",
+    "messages": [
+      {"role": "user", "content": "他说作业明天交。"},
+      {"role": "assistant", "content": "好，那今天记得做完。"},
+      {"role": "user", "content": "那后天呢？"}
+    ]
+  },
+  {
+    "id": "ambiguity",
+    "goal": "信息不足时自然澄清，而不是强行假设",
+    "messages": [
+      {"role": "user", "content": "他说‘随便’，但我不知道他到底想吃什么，我怎么回？"}
+    ]
+  },
+  {
+    "id": "emotion",
+    "goal": "理解负面情绪并给出简短、贴合语境的回应",
+    "messages": [
+      {"role": "user", "content": "朋友说今天特别难受，我怎么简短关心一下？"}
+    ]
+  },
+  {
+    "id": "correction",
+    "goal": "在用户纠正信息后更新判断",
+    "messages": [
+      {"role": "user", "content": "小王周六有空。"},
+      {"role": "assistant", "content": "那可以约周六。"},
+      {"role": "user", "content": "不对，我刚看错了，是周日。"},
+      {"role": "assistant", "content": "好，那改周日。"},
+      {"role": "user", "content": "所以约哪天？"}
+    ]
+  },
+  {
+    "id": "vision",
+    "goal": "实际读取图片，而不是回复占位符",
+    "use_image": true,
+    "messages": [
+      {"role": "user", "content": "请简短描述图片里最主要的内容。"}
+    ]
+  }
+]

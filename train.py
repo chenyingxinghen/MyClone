@@ -25,9 +25,12 @@ Single GPU (falls back automatically):
 """
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 # Reduce fragmentation OOM on 16GB T4/P100 (the error message suggests this).
@@ -35,18 +38,18 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from accelerate import PartialState
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 
-MAX_SEQ_LENGTH = 2048
+DEFAULT_MAX_SEQ_LENGTH = 2048
 
 
 def find_dataset_dir():
-    local = Path("./dataset/sft")
-    if (local / "sft-my.json").exists():
-        return str(local)
+    for local in (Path("./data/dataset/sft"), Path("./dataset/sft")):
+        if (local / "sft-my.json").exists():
+            return str(local)
 
     kaggle_input = Path("/kaggle/input")
     if kaggle_input.exists():
@@ -56,7 +59,7 @@ def find_dataset_dir():
             if (d / "sft-my.json").exists():
                 return str(d)
 
-    return str(local)
+    return "./data/dataset/sft"
 
 
 def load_sft_dataset(dataset_dir):
@@ -75,9 +78,98 @@ def load_sft_dataset(dataset_dir):
         if item.get("system"):
             msgs.append({"role": "system", "content": item["system"]})
         msgs.extend(item["messages"])
-        conversations.append({"messages": msgs})
+        conversations.append({
+            "messages": msgs,
+            "time": item.get("time"),
+            "source": item.get("source", ""),
+            "id": item.get("id", ""),
+        })
 
     return Dataset.from_list(conversations)
+
+
+def audit_dataset(dataset, allow_leaky_data=False):
+    """Fail fast on structures that make the training loss misleading."""
+    invalid = 0
+    answer_leaks = 0
+    assistant_turns = 0
+    format_artifacts = 0
+    copied_user_replies = 0
+    for row in dataset:
+        msgs = row.get("messages", [])
+        start = 1 if msgs and msgs[0].get("role") == "system" else 0
+        body = msgs[start:]
+        if (not body or len(body) % 2
+                or any(m.get("role") != ("user" if i % 2 == 0 else "assistant")
+                       for i, m in enumerate(body))):
+            invalid += 1
+        for msg in body:
+            if msg.get("role") == "assistant":
+                assistant_turns += 1
+            if msg.get("role") == "user" and "<begin_chat>你应该说：" in msg.get("content", ""):
+                answer_leaks += 1
+        for i in range(0, len(body) - 1, 2):
+            user = body[i].get("content", "").strip()
+            reply = strip_thinking(body[i + 1].get("content", ""))
+            format_artifacts += len(re.findall(r"\[[^\]\n]{1,240}\]", user))
+            format_artifacts += len(re.findall(r"\[[^\]\n]{1,240}\]", reply))
+            format_artifacts += sum(
+                line.strip().startswith("@") for line in reply.splitlines()
+            )
+            copied_user_replies += bool(len(user) >= 4 and user in reply)
+
+    if invalid:
+        raise ValueError(f"Dataset has {invalid} conversations with invalid role alternation.")
+    if answer_leaks and not allow_leaky_data:
+        raise ValueError(
+            f"Dataset has {answer_leaks} user turns containing the target answer "
+            "(<begin_chat>你应该说：...). Re-run process_data.py with the current "
+            "config, or explicitly pass --allow-leaky-data to reproduce an old run."
+        )
+    if format_artifacts:
+        raise ValueError(
+            f"Dataset has {format_artifacts} exporter artifacts such as [引用], "
+            "[图片] or standalone @ mentions. Re-run process_data.py."
+        )
+    if copied_user_replies:
+        raise ValueError(
+            f"Dataset has {copied_user_replies} assistant replies that copy the full "
+            "user message. Re-run process_data.py."
+        )
+    return {"conversations": len(dataset), "assistant_turns": assistant_turns,
+            "answer_leaks": answer_leaks, "format_artifacts": format_artifacts,
+            "copied_user_replies": copied_user_replies}
+
+
+def split_dataset(dataset, eval_ratio, strategy):
+    if not eval_ratio or not 0 < eval_ratio < 1 or len(dataset) < 20:
+        return dataset, None
+
+    if strategy == "chronological" and "time" in dataset.column_names:
+        # Hold out each contact/source's newest conversations. A single global
+        # cutoff can accidentally put only the most recently active contact in
+        # eval, which says little about generalization across relationships.
+        groups = defaultdict(list)
+        has_source = "source" in dataset.column_names
+        for index in range(len(dataset)):
+            source = dataset[index].get("source", "") if has_source else "all"
+            groups[source or "unknown"].append(index)
+
+        train_indices, eval_indices = [], []
+        for indices in groups.values():
+            ordered = sorted(indices, key=lambda i: str(dataset[i].get("time") or ""))
+            if len(ordered) < 2:
+                train_indices.extend(ordered)
+                continue
+            count = max(1, int(round(len(ordered) * eval_ratio)))
+            count = min(count, len(ordered) - 1)
+            train_indices.extend(ordered[:-count])
+            eval_indices.extend(ordered[-count:])
+        if train_indices and eval_indices:
+            return dataset.select(train_indices), dataset.select(eval_indices)
+
+    split = dataset.train_test_split(test_size=eval_ratio, seed=3407)
+    return split["train"], split["test"]
 
 
 def get_dataset_system_prompt(dataset):
@@ -125,7 +217,8 @@ def strip_thinking(reply):
     return text
 
 
-def generate_test(model, tokenizer, prompts, system_prompt=None, max_new_tokens=64):
+def generate_test(model, tokenizer, prompts, system_prompt=None, max_new_tokens=64,
+                  temperature=0.2):
     model.eval()
     for prompt in prompts:
         msgs = []
@@ -134,18 +227,96 @@ def generate_test(model, tokenizer, prompts, system_prompt=None, max_new_tokens=
         msgs.append({"role": "user", "content": prompt})
         text = render_chat(tokenizer, msgs, add_generation_prompt=True)
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
+        torch.manual_seed(3407)
+        generate_args = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": tokenizer.eos_token_id,
+            "do_sample": temperature > 0,
+        }
+        if temperature > 0:
+            generate_args.update(temperature=temperature, top_p=0.9)
         with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=0.7,
-                do_sample=True,
-                top_p=0.9,
-                pad_token_id=tokenizer.eos_token_id,
-            )
+            outputs = model.generate(**inputs, **generate_args)
         reply = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+        reply = strip_thinking(reply)
         print(f"\nUser: {prompt}")
-        print(f"Model: {strip_thinking(reply)}")
+        print(f"Model ({reply.count(chr(10)) + 1} message line(s)): {reply}")
+
+
+def expand_prompt_completion(dataset):
+    """Turn each assistant reply into an explicit masked completion example."""
+    examples = []
+    for row_index, row in enumerate(dataset):
+        messages = row.get("messages", [])
+        system = messages[:1] if messages and messages[0].get("role") == "system" else []
+        body = messages[len(system):]
+        history = list(system)
+        for pair_index in range(0, len(body) - 1, 2):
+            user, assistant = body[pair_index:pair_index + 2]
+            examples.append({
+                "prompt": history + [user],
+                "completion": [assistant],
+                "time": row.get("time"),
+                "source": row.get("source", ""),
+                "id": f"{row.get('id', row_index)}:completion:{pair_index}",
+            })
+            history.extend([user, assistant])
+    return Dataset.from_list(examples)
+
+
+def oversample_multiline_completions(dataset, extra_copies, log):
+    """Duplicate only clean multiline completions in the training split."""
+    if extra_copies <= 0:
+        return dataset, 0
+
+    focused = []
+    for row_index, row in enumerate(dataset):
+        completion = row.get("completion", [])
+        reply = strip_thinking(completion[0].get("content", "")) if completion else ""
+        if "\n" not in reply:
+            continue
+        for copy_index in range(extra_copies):
+            clone = dict(row)
+            clone["id"] = f"{row.get('id', row_index)}:multiline:{copy_index}"
+            focused.append(clone)
+
+    if not focused:
+        log("Multiline oversampling requested, but no multiline completions were found.")
+        return dataset, 0
+    augmented = concatenate_datasets([dataset, Dataset.from_list(focused)])
+    log(f"Multiline oversampling: added {len(focused)} clean completion examples "
+        f"({extra_copies} extra copies per multiline completion).")
+    return augmented, len(focused)
+
+
+def cap_ultrashort_completions(dataset, max_share, log):
+    """Limit single-line 1-2 character completions in the training split."""
+    if max_share >= 1:
+        return dataset, 0
+    max_share = max(0.0, max_share)
+    ultrashort, other = [], []
+    for index, row in enumerate(dataset):
+        completion = row.get("completion", [])
+        reply = strip_thinking(completion[0].get("content", "")) if completion else ""
+        target = ultrashort if 0 < len(reply) <= 2 and "\n" not in reply else other
+        target.append(index)
+    if not ultrashort:
+        return dataset, 0
+
+    allowed = int((max_share / max(1e-9, 1 - max_share)) * len(other))
+    allowed = min(len(ultrashort), allowed)
+    ranked = sorted(
+        ultrashort,
+        key=lambda i: hashlib.sha256(
+            str(dataset[i].get("id", i)).encode("utf-8")
+        ).hexdigest(),
+    )
+    keep = sorted(other + ranked[:allowed])
+    removed = len(ultrashort) - allowed
+    filtered = dataset.select(keep)
+    log(f"Ultra-short balancing: kept {allowed}/{len(ultrashort)} single-line "
+        f"1-2 character completions; removed {removed} from train only.")
+    return filtered, removed
 
 
 def load_tokenizer(model_id, log):
@@ -230,19 +401,36 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=3e-5)
-    parser.add_argument("--lora-rank", type=int, default=16)
-    parser.add_argument("--lora-dropout", type=float, default=0.05)
-    parser.add_argument("--eval-ratio", type=float, default=0.05,
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=int, default=None,
+                        help="LoRA alpha. Defaults to rank/2 so style tuning "
+                             "does not overpower the base model.")
+    parser.add_argument("--lora-dropout", type=float, default=0.08)
+    parser.add_argument("--eval-ratio", type=float, default=0.08,
                         help="Fraction held out for validation (0 disables eval).")
+    parser.add_argument("--eval-strategy", choices=("chronological", "random"),
+                        default="chronological",
+                        help="Use newest conversations for eval by default; this "
+                             "better measures future-chat generalization than a "
+                             "random near-duplicate split.")
     parser.add_argument("--eval-steps", type=int, default=50,
                         help="Run validation every N steps (also the save cadence).")
     parser.add_argument("--early-stopping-patience", type=int, default=3,
                         help="Stop after N evals without val-loss improvement.")
     parser.add_argument("--no-assistant-only-loss", action="store_true",
-                        help="Train on all tokens instead of masking user/system "
-                             "turns. Use this if assistant-only loss errors on the "
-                             "model's chat template.")
+                        help="Disable completion-only masking and train prompt tokens too. "
+                             "Unsafe for chat cloning; retained only for debugging.")
+    parser.add_argument("--allow-leaky-data", action="store_true",
+                        help="Allow legacy samples that contain their target answer "
+                             "inside the user turn. Not recommended.")
+    parser.add_argument("--max-seq-length", type=int, default=DEFAULT_MAX_SEQ_LENGTH)
+    parser.add_argument("--multiline-oversample", type=int, default=1,
+                        help="Extra focused training copies per assistant reply "
+                             "containing message-boundary newlines (0 disables).")
+    parser.add_argument("--max-ultrashort-share", type=float, default=0.20,
+                        help="Maximum share of single-line 1-2 character completion "
+                             "examples before multiline oversampling (0-1).")
     parser.add_argument("--model-parallel", action="store_true",
                         help="Shard ONE model across all visible GPUs "
                              "(device_map='auto') instead of DDP. Use for models "
@@ -255,11 +443,15 @@ def main():
                              "Defaults to the first dataset system prompt.")
     parser.add_argument("--test-max-new-tokens", type=int, default=64,
                         help="Max new tokens for before/after test generations.")
+    parser.add_argument("--test-temperature", type=float, default=0.2,
+                        help="Stable sampling temperature for before/after tests; "
+                             "0 uses greedy decoding.")
     parser.add_argument("--test-prompts", type=str, nargs="*", default=[
-        "没有",
         "在干嘛",
         "今天累死了",
         "周末有空吗",
+        "我刚下课，又饿又困，外面还下雨了",
+        "我其实没生气，就是刚才语气有点急",
     ], help="Test prompts for before/after comparison")
     args = parser.parse_args()
 
@@ -278,8 +470,11 @@ def main():
     output_dir = args.output or ("/kaggle/working/output" if is_kaggle else "./output")
 
     dataset = load_sft_dataset(dataset_dir)
+    audit = audit_dataset(dataset, args.allow_leaky_data)
     test_system_prompt = args.system_prompt or get_dataset_system_prompt(dataset)
     log(f"Loaded {len(dataset)} conversations from {dataset_dir}")
+    log(f"Dataset audit: {audit['assistant_turns']} assistant turns, "
+        f"answer leaks={audit['answer_leaks']}")
     log(f"World size: {state.num_processes} GPU(s)")
     if test_system_prompt:
         log(f"Test system prompt: {test_system_prompt}")
@@ -322,9 +517,10 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     model = prepare_model_for_kbit_training(model)
+    lora_alpha = args.lora_alpha or max(1, args.lora_rank // 2)
     peft_config = LoraConfig(
         r=args.lora_rank,
-        lora_alpha=args.lora_rank,
+        lora_alpha=lora_alpha,
         lora_dropout=args.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
@@ -334,47 +530,59 @@ def main():
         ],
     )
     model = get_peft_model(model, peft_config)
+    vision_trainable = [
+        name for name, param in model.named_parameters()
+        if param.requires_grad and ("vision" in name.lower() or "visual" in name.lower())
+    ]
+    if vision_trainable:
+        raise RuntimeError(
+            "LoRA unexpectedly attached to vision modules. Keep the visual tower "
+            f"frozen for text-only style tuning. Examples: {vision_trainable[:5]}"
+        )
     cast_trainable_params_to_fp32(model, log)
     if is_main:
         model.print_trainable_parameters()
 
-    # Assistant-only loss: mask user/system tokens so the model only learns to
-    # imitate the assistant's replies — the whole point of style cloning. Needs
-    # a TRL new enough to accept `assistant_only_loss`; for known families
-    # (Qwen3) TRL auto-patches the chat template to emit the assistant mask.
+    # Prompt-completion data gives us a reliable boundary independent of whether
+    # the model's Jinja chat template exposes a `{% generation %}` assistant mask.
     import inspect
     sft_params = inspect.signature(SFTConfig.__init__).parameters
-    use_aol = ("assistant_only_loss" in sft_params) and not args.no_assistant_only_loss
+    if "completion_only_loss" not in sft_params:
+        raise RuntimeError(
+            "Installed TRL does not support completion_only_loss. Upgrade TRL; "
+            "refusing to risk training on user/system tokens."
+        )
+    use_completion_loss = not args.no_assistant_only_loss
 
-    # Pre-render each conversation with the chat template into a "text" column.
-    def formatting_func(examples):
-        return {"text": [
-            render_chat(tokenizer, m, add_generation_prompt=False)
-            for m in examples["messages"]
-        ]}
+    raw_train, raw_eval = split_dataset(dataset, args.eval_ratio, args.eval_strategy)
+    train_conversation_count = len(raw_train)
+    eval_conversation_count = len(raw_eval) if raw_eval is not None else 0
+    train_completions = expand_prompt_completion(raw_train)
+    eval_completions = expand_prompt_completion(raw_eval) if raw_eval is not None else None
+    train_completion_count = len(train_completions)
+    train_completions, ultrashort_examples_removed = cap_ultrashort_completions(
+        train_completions, args.max_ultrashort_share, log)
+    train_completion_count_after_short_balance = len(train_completions)
+    train_completions, multiline_examples_added = oversample_multiline_completions(
+        train_completions, args.multiline_oversample, log)
 
-    if use_aol:
-        # Keep the conversational `messages` column — SFTTrainer applies the
-        # chat template itself and builds the assistant token mask from it.
-        # Pre-rendering to text would throw away the role boundaries it needs.
-        prepared = dataset
-        log("Assistant-only loss: ON (masking user/system tokens)")
-    else:
-        with state.main_process_first():
-            prepared = dataset.map(formatting_func, batched=True,
-                                   remove_columns=dataset.column_names)
-        log("Assistant-only loss: OFF (training on all tokens)")
+    def prepare(split):
+        if split is None:
+            return None
+        drop = [c for c in split.column_names if c not in ("prompt", "completion")]
+        return split.remove_columns(drop) if drop else split
 
-    # Hold out a validation split so eval loss can flag overfitting and drive
-    # early stopping. Deterministic seed → identical split on every DDP rank.
-    eval_dataset = None
-    if args.eval_ratio and 0 < args.eval_ratio < 1 and len(prepared) >= 20:
-        split = prepared.train_test_split(test_size=args.eval_ratio, seed=3407)
-        train_dataset, eval_dataset = split["train"], split["test"]
+    train_dataset = prepare(train_completions)
+    eval_dataset = prepare(eval_completions)
+    log("Completion-only loss: " + ("ON (prompt/user/system tokens masked)"
+                                     if use_completion_loss
+                                     else "OFF - DEBUG ONLY"))
+    if eval_dataset is not None:
+        eval_sources = len(set(raw_eval["source"])) if "source" in raw_eval.column_names else 0
         log(f"Split: {len(train_dataset)} train / {len(eval_dataset)} eval "
-            f"({args.eval_ratio:.0%} held out)")
+            f"({args.eval_ratio:.0%}, {args.eval_strategy}, "
+            f"sources={eval_sources or 'n/a'})")
     else:
-        train_dataset = prepared
         log("Eval disabled (eval-ratio=0 or dataset too small)")
 
     # Before-training sample (main process only, to avoid duplicate output).
@@ -383,10 +591,11 @@ def main():
         print("BEFORE TRAINING - Test generations")
         print("=" * 60)
         generate_test(model, tokenizer, args.test_prompts,
-                      test_system_prompt, args.test_max_new_tokens)
+                      test_system_prompt, args.test_max_new_tokens,
+                      args.test_temperature)
 
     log(f"\nTraining: {args.epochs} epochs, per-device bs={args.batch_size}x{args.grad_accum}, "
-        f"lr={args.lr}, rank={args.lora_rank}")
+        f"lr={args.lr}, rank={args.lora_rank}, alpha={lora_alpha}")
     log(f"Effective batch = {args.batch_size} x {args.grad_accum} x {state.num_processes} "
         f"= {args.batch_size * args.grad_accum * state.num_processes}")
     log(f"Output: {output_dir}\n")
@@ -396,11 +605,7 @@ def main():
     seq_len_kwarg = "max_seq_length" if "max_seq_length" in sft_params else "max_length"
 
     extra_cfg = {}
-    if use_aol:
-        extra_cfg["assistant_only_loss"] = True
-    else:
-        # Only meaningful when we pre-rendered a "text" column above.
-        extra_cfg["dataset_text_field"] = "text"
+    extra_cfg["completion_only_loss"] = use_completion_loss
 
     callbacks = []
     if eval_dataset is not None:
@@ -450,7 +655,7 @@ def main():
         dataset_num_proc=1,
         report_to="none",
         **extra_cfg,
-        **{seq_len_kwarg: MAX_SEQ_LENGTH},
+        **{seq_len_kwarg: args.max_seq_length},
     )
 
     trainer = build_trainer(model, tokenizer, train_dataset, eval_dataset,
@@ -463,10 +668,48 @@ def main():
         print("AFTER TRAINING - Test generations")
         print("=" * 60)
         generate_test(model, tokenizer, args.test_prompts,
-                      test_system_prompt, args.test_max_new_tokens)
+                      test_system_prompt, args.test_max_new_tokens,
+                      args.test_temperature)
 
         model.save_pretrained(output_dir)
         tokenizer.save_pretrained(output_dir)
+        with open(os.path.join(output_dir, "training_manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "base_model": args.model,
+                "text_only_lora": True,
+                "vision_modules_trainable": False,
+                "dataset": dataset_dir,
+                "dataset_audit": audit,
+                "eval_strategy": args.eval_strategy,
+                "hyperparameters": {
+                    "epochs": args.epochs,
+                    "learning_rate": args.lr,
+                    "lora_rank": args.lora_rank,
+                    "lora_alpha": lora_alpha,
+                    "lora_dropout": args.lora_dropout,
+                    "max_seq_length": args.max_seq_length,
+                    "multiline_oversample": args.multiline_oversample,
+                    "max_ultrashort_share": args.max_ultrashort_share,
+                },
+                "training_rows": {
+                    "train_conversations": train_conversation_count,
+                    "eval_conversations": eval_conversation_count,
+                    "completion_examples_before_multiline_oversample": train_completion_count,
+                    "ultrashort_examples_removed": ultrashort_examples_removed,
+                    "completion_examples_after_ultrashort_balance":
+                        train_completion_count_after_short_balance,
+                    "focused_multiline_examples_added": multiline_examples_added,
+                    "completion_examples_after_multiline_oversample": len(train_completions),
+                    "eval_completion_examples": len(eval_completions)
+                    if eval_completions is not None else 0,
+                },
+                "loss_mode": "completion_only" if use_completion_loss else "all_tokens",
+                "deployment_note": (
+                    "For multimodal Ollama deployment, convert only the LoRA adapter "
+                    "to GGUF and attach it to the original vision-capable base model. "
+                    "Do not merge the full VLM into a text-only GGUF."
+                ),
+            }, f, ensure_ascii=False, indent=2)
         print(f"\nDone! LoRA adapter saved to: {output_dir}")
         if is_kaggle:
             print("Download from the notebook's Output tab.")
