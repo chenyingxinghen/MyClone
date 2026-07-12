@@ -94,7 +94,7 @@ pip install -r requirements.txt
 python prepare_kaggle_bundle.py
 ```
 
-上传 `dist/myclone-kaggle-bundle-v3.1.zip` 为 Kaggle Dataset，然后在 Notebook 中运行 `run_kaggle.py`。v3.1 会清除引用、图片、转账、链接、@ 等导出伪文本，并把每个助手回复转换为显式 prompt-completion 样本；脚本会先执行 `validate_dataset.py`，再开始训练。
+上传 `dist/myclone-kaggle-bundle-v3.3.zip` 为 Kaggle Dataset，然后在 Notebook 中运行 `run_kaggle.py`。v3.3 会清除引用、图片、转账、链接、@ 等导出伪文本，并通过同一次完整聊天模板 tokenization 生成显式助手 labels，兼容 Transformers 5.x 的 BatchEncoding 返回值，避免 Qwen3.5 特殊 token 导致 completion mask 偏移；脚本会先执行 `validate_dataset.py`，再开始训练。
 
 Kaggle Notebook 的第一个 cell 可以直接使用下面的启动器，无论平台把 zip 保留原样还是自动解包都能运行：
 

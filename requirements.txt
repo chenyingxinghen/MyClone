@@ -2,7 +2,8 @@
 # For plain Qwen2.5/Qwen3 dense text models, transformers>=4.51 is enough.
 transformers>=5.4.0
 peft>=0.13.0
-# assistant_only_loss + Qwen3 template auto-patch land in newer TRL.
+# Newer TRL supports the current SFTConfig/API. train.py supplies explicit
+# labels and does not rely on TRL's conversational prompt-prefix masking.
 trl>=0.20.0
 bitsandbytes>=0.44.0
 accelerate>=1.0.0

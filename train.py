@@ -208,6 +208,32 @@ def render_chat(tokenizer, messages, add_generation_prompt):
         )
 
 
+def tokenize_chat(tokenizer, messages):
+    """Tokenize one complete conversation with thinking disabled when supported."""
+    kwargs = dict(tokenize=True, add_generation_prompt=False)
+    try:
+        encoded = tokenizer.apply_chat_template(messages, enable_thinking=False, **kwargs)
+    except TypeError:
+        encoded = tokenizer.apply_chat_template(messages, **kwargs)
+
+    # transformers 5.x may return BatchEncoding instead of a bare list even
+    # without return_tensors. Iterating BatchEncoding yields field names such as
+    # "input_ids", which previously made every full/empty sequence look equal.
+    if hasattr(encoded, "get"):
+        encoded = encoded.get("input_ids")
+    if hasattr(encoded, "tolist"):
+        encoded = encoded.tolist()
+    if (isinstance(encoded, list) and len(encoded) == 1
+            and isinstance(encoded[0], list)):
+        encoded = encoded[0]
+    if not isinstance(encoded, list) or not all(isinstance(token, int) for token in encoded):
+        raise TypeError(
+            "apply_chat_template returned unsupported token data: "
+            f"{type(encoded).__name__}"
+        )
+    return encoded
+
+
 def strip_thinking(reply):
     # Peel off any leading think blocks (a prefilled empty one plus, defensively,
     # one the model may still emit) so only the final reply is shown.
@@ -317,6 +343,66 @@ def cap_ultrashort_completions(dataset, max_share, log):
     log(f"Ultra-short balancing: kept {allowed}/{len(ultrashort)} single-line "
         f"1-2 character completions; removed {removed} from train only.")
     return filtered, removed
+
+
+def tokenize_completion_examples(dataset, tokenizer, max_length, completion_only, log):
+    """Build labels from one full-template tokenization per example.
+
+    TRL normally tokenizes a conversational prompt with
+    ``add_generation_prompt=True`` and then tokenizes prompt+completion again.
+    Qwen3.5's template can add thinking/special tokens only in the former, so
+    those sequences are not prefixes and TRL's completion mask is shifted.  We
+    instead compare a full answer with the same conversation containing an
+    empty assistant answer.  Both take the exact same template path.
+    """
+    tokenized = []
+    boundary_fallbacks = 0
+    total = len(dataset)
+    log(f"Building explicit token labels for {total} examples...")
+    for row_index, row in enumerate(dataset, 1):
+        prompt = list(row.get("prompt", []))
+        completion = list(row.get("completion", []))
+        if not completion:
+            continue
+        full_ids = list(tokenize_chat(tokenizer, prompt + completion))
+        empty_answer = dict(completion[0])
+        empty_answer["content"] = ""
+        empty_ids = list(tokenize_chat(tokenizer, prompt + [empty_answer]))
+
+        boundary = 0
+        for full_token, empty_token in zip(full_ids, empty_ids):
+            if full_token != empty_token:
+                break
+            boundary += 1
+        if boundary >= len(full_ids):
+            boundary_fallbacks += 1
+            continue
+
+        labels = list(full_ids)
+        if completion_only:
+            labels[:boundary] = [-100] * boundary
+
+        # Keep the end so the assistant target is never truncated away by long
+        # history. The prompt's most recent context is retained as well.
+        if max_length and len(full_ids) > max_length:
+            full_ids = full_ids[-max_length:]
+            labels = labels[-max_length:]
+        if completion_only and all(label == -100 for label in labels):
+            boundary_fallbacks += 1
+            continue
+        tokenized.append({"input_ids": full_ids, "labels": labels})
+        if row_index % 500 == 0 or row_index == total:
+            log(f"Explicit token labels progress: {row_index}/{total}")
+
+    if boundary_fallbacks:
+        raise RuntimeError(
+            f"Could not derive a non-empty assistant token span for "
+            f"{boundary_fallbacks} examples; refusing ambiguous loss masks."
+        )
+    log(f"Explicit token labels: built {len(tokenized)} examples with "
+        f"{'prompt tokens masked' if completion_only else 'all tokens trainable'}; "
+        "TRL prompt-prefix inference bypassed.")
+    return Dataset.from_list(tokenized)
 
 
 def load_tokenizer(model_id, log):
@@ -543,15 +629,10 @@ def main():
     if is_main:
         model.print_trainable_parameters()
 
-    # Prompt-completion data gives us a reliable boundary independent of whether
-    # the model's Jinja chat template exposes a `{% generation %}` assistant mask.
+    # We construct explicit labels below instead of relying on either Jinja
+    # generation masks or TRL's prompt-prefix inference.
     import inspect
     sft_params = inspect.signature(SFTConfig.__init__).parameters
-    if "completion_only_loss" not in sft_params:
-        raise RuntimeError(
-            "Installed TRL does not support completion_only_loss. Upgrade TRL; "
-            "refusing to risk training on user/system tokens."
-        )
     use_completion_loss = not args.no_assistant_only_loss
 
     raw_train, raw_eval = split_dataset(dataset, args.eval_ratio, args.eval_strategy)
@@ -565,18 +646,14 @@ def main():
     train_completion_count_after_short_balance = len(train_completions)
     train_completions, multiline_examples_added = oversample_multiline_completions(
         train_completions, args.multiline_oversample, log)
-
-    def prepare(split):
-        if split is None:
-            return None
-        drop = [c for c in split.column_names if c not in ("prompt", "completion")]
-        return split.remove_columns(drop) if drop else split
-
-    train_dataset = prepare(train_completions)
-    eval_dataset = prepare(eval_completions)
-    log("Completion-only loss: " + ("ON (prompt/user/system tokens masked)"
-                                     if use_completion_loss
-                                     else "OFF - DEBUG ONLY"))
+    train_dataset = tokenize_completion_examples(
+        train_completions, tokenizer, args.max_seq_length, use_completion_loss, log)
+    eval_dataset = (tokenize_completion_examples(
+        eval_completions, tokenizer, args.max_seq_length, use_completion_loss, log)
+        if eval_completions is not None else None)
+    log("Completion-only loss: " +
+        ("ON (explicit labels; prompt/user/system tokens masked)"
+         if use_completion_loss else "OFF - DEBUG ONLY"))
     if eval_dataset is not None:
         eval_sources = len(set(raw_eval["source"])) if "source" in raw_eval.column_names else 0
         log(f"Split: {len(train_dataset)} train / {len(eval_dataset)} eval "
@@ -605,7 +682,10 @@ def main():
     seq_len_kwarg = "max_seq_length" if "max_seq_length" in sft_params else "max_length"
 
     extra_cfg = {}
-    extra_cfg["completion_only_loss"] = use_completion_loss
+    # Labels are already explicit. Disable TRL's prompt/completion inference so
+    # Qwen3.5 cannot produce shifted masks or prefix-mismatch warning floods.
+    if "completion_only_loss" in sft_params:
+        extra_cfg["completion_only_loss"] = False
 
     callbacks = []
     if eval_dataset is not None:

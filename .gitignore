@@ -19,3 +19,4 @@ model_process/base_model_cache/
 model_process/llama.cpp-src/
 eval-report*.json
 .tmp*
+.env*

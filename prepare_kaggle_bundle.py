@@ -21,7 +21,7 @@ def sha256(path: Path) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="./data/dataset/sft")
-    parser.add_argument("--output", default="./dist/myclone-kaggle-bundle-v3.1.zip")
+    parser.add_argument("--output", default="./dist/myclone-kaggle-bundle-v3.3.zip")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent
@@ -56,7 +56,7 @@ def main() -> int:
         return 2
 
     manifest = {
-        "bundle_version": "3.1",
+        "bundle_version": "3.3",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "files": {archive: {"sha256": sha256(path), "bytes": path.stat().st_size}
                   for path, archive in files.items()},
